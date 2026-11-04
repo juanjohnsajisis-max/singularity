@@ -1,0 +1,28 @@
+appId: com.singularity.lnpforge
+productName: LNP Forge
+copyright: LNP Forge — local-only educational tool
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - electron/**/*
+  - out/**/*
+  - package.json
+
+# Windows exe via NSIS installer + a portable one-file exe
+win:
+  target:
+    - nsis
+    - portable
+  artifactName: ${productName}-${version}-${arch}.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+
+portable:
+  artifactName: ${productName}-Portable-${version}.${ext}
