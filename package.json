@@ -12,14 +12,10 @@
     "postinstall": "node tools/install-electron.mjs --optional",
     "electron:install": "node tools/install-electron.mjs",
     "electron:doctor": "node tools/install-electron.mjs --check",
-    "preelectron:dev": "node tools/install-electron.mjs",
-    "electron:dev": "next build && electron .",
-    "preelectron:start": "node tools/install-electron.mjs",
-    "electron:start": "electron .",
-    "prebundle": "node tools/install-electron.mjs",
-    "bundle": "next build && electron-builder --win",
-    "prebundle:dir": "node tools/install-electron.mjs",
-    "bundle:dir": "next build && electron-builder --win dir"
+    "electron:dev": "node tools/electron-dev.mjs",
+    "electron:start": "node tools/electron-dev.mjs --no-build",
+    "bundle": "node tools/electron-dev.mjs --bundle",
+    "bundle:dir": "node tools/electron-dev.mjs --bundle-dir"
   },
   "dependencies": {
     "lenis": "^1.1.18",

@@ -31,13 +31,23 @@ npm run build       # static export to out/
 ## Desktop app (Electron, Windows exe)
 
 ```bash
-npm run electron:dev    # static build, then open it in Electron
+npm run electron:dev    # binary check → next build → export check → open in Electron
+npm run electron:start  # same, but reuse the existing out/ (no rebuild)
 npm run bundle          # builds out/ + NSIS installer + portable exe in release/
 npm run bundle:dir      # same, but only the unpacked app folder (faster, no installer)
 ```
 
-`npm install` downloads the Electron binary once (postinstall). To check/repair it
-at any time:
+Each of those is a **single script** (`tools/electron-dev.mjs`) that does the whole
+job itself — it does not rely on npm `pre*`/`post*` hooks, because newer npm
+versions gate dependency install scripts (`install-scripts approve …`) and skip
+lifecycle hooks entirely when `ignore-scripts` is set. So `npm run electron:dev`
+always installs the Electron binary, builds, verifies the export, and launches.
+
+Useful flags: `--no-build`, `--bundle`, `--bundle-dir`, `--dry-run`.
+
+`npm install` also tries to fetch the Electron binary once (postinstall) — that is
+just a convenience; if your npm blocks it, `npm run electron:dev` handles it. To
+check/repair the binary at any time:
 
 ```bash
 npm run electron:doctor                        # report whether the binary is present and usable
@@ -130,6 +140,22 @@ npm run electron:install -- --zip C:\Users\juanj\Downloads\electron-v33.4.11-win
 #    (it must contain electron.exe and a `version` file) and create
 #    node_modules\electron\path.txt containing exactly:  electron.exe  (no newline)
 ```
+
+### `Next.js inferred your workspace root` warning
+
+```
+⚠ Warning: Next.js inferred your workspace root, but it may not be correct.
+We detected multiple lockfiles and selected the directory of C:\Users\<you>\Documents\package-lock.json
+```
+
+Next walks up the directory tree looking for a lockfile. If there is a stray
+`package-lock.json` (or `yarn.lock`/`pnpm-lock.yaml`) in a parent folder — a very
+common leftover of running `npm install` in `Documents`, `Desktop`, or your home
+directory — it picks *that* as the workspace root.
+
+`next.config.mjs` now pins `outputFileTracingRoot` to this project, so the build
+is correct regardless; the warning disappears with it. You can also delete the
+stray lockfile above the project.
 
 Notes for Windows:
 
