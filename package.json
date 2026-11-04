@@ -8,8 +8,12 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "electron:install": "node node_modules/electron/install.js",
+    "preelectron:dev": "npm run electron:install",
     "electron:dev": "next build && electron .",
+    "prebundle": "npm run electron:install",
     "bundle": "next build && electron-builder --win",
+    "prebundle:dir": "npm run electron:install",
     "bundle:dir": "next build && electron-builder --win dir"
   },
   "dependencies": {
