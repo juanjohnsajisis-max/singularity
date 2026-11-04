@@ -7,13 +7,18 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "verify:export": "node tools/check-export.mjs",
     "start": "next start",
-    "electron:install": "node node_modules/electron/install.js",
-    "preelectron:dev": "npm run electron:install",
+    "postinstall": "node tools/install-electron.mjs --optional",
+    "electron:install": "node tools/install-electron.mjs",
+    "electron:doctor": "node tools/install-electron.mjs --check",
+    "preelectron:dev": "node tools/install-electron.mjs",
     "electron:dev": "next build && electron .",
-    "prebundle": "npm run electron:install",
+    "preelectron:start": "node tools/install-electron.mjs",
+    "electron:start": "electron .",
+    "prebundle": "node tools/install-electron.mjs",
     "bundle": "next build && electron-builder --win",
-    "prebundle:dir": "npm run electron:install",
+    "prebundle:dir": "node tools/install-electron.mjs",
     "bundle:dir": "next build && electron-builder --win dir"
   },
   "dependencies": {
