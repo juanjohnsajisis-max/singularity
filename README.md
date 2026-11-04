@@ -40,10 +40,17 @@ npm run bundle:dir      # same, but only the unpacked app folder (faster, no ins
 at any time:
 
 ```bash
-npm run electron:doctor    # report whether the binary is present and usable
-npm run electron:install   # (re)install it; add -- --force to re-download
-npm run verify:export      # sanity-check out/ before shipping it in the shell
+npm run electron:doctor                        # report whether the binary is present and usable
+npm run electron:install                       # (re)install it
+npm run electron:install -- --force            # re-download and reinstall
+npm run electron:install -- --zip <file.zip>   # install from a zip you downloaded
+npm run verify:export                          # sanity-check out/ before shipping it in the shell
 ```
+
+`npm install` may still print
+`npm warn install-scripts   electron@33.4.11 (postinstall: node install.js)`.
+That is expected and harmless: electron's own postinstall is not used any more —
+this project installs the binary itself.
 
 Installing the Electron binary needs one ~100 MB download from `github.com`. If
 that is blocked (corporate proxy/firewall, offline machine), see
@@ -90,6 +97,20 @@ npm run electron:install -- --force           # re-download from scratch
 npm run electron:dev                          # build + launch
 ```
 
+The installer reports progress while it unpacks (~250 MB) and aborts with a
+clear message if the extraction **stalls** for 2 minutes instead of hanging
+forever or exiting silently. If that happens:
+
+```bash
+npm run electron:install -- --zip "%LOCALAPPDATA%\electron\Cache\<hash>\electron-v33.4.11-win32-x64.zip"
+```
+
+(the exact cache path is printed by the installer). Stalled or failing
+extractions are almost always caused by the project living inside a synced
+folder, or by antivirus scanning every file written into `node_modules` — move
+the project to a local path like `C:\dev\singularity`, or add `node_modules` to
+your antivirus exclusions.
+
 If the download is blocked, use a mirror or install the zip by hand:
 
 ```bash
@@ -101,10 +122,13 @@ npm run electron:install -- --force
 set HTTPS_PROXY=http://user:pass@host:port      # cmd
 $env:HTTPS_PROXY="http://user:pass@host:port"   # PowerShell
 
-# 3. by hand: download
+# 3. download the zip in a browser (any machine), then let the installer unpack it
 #    https://github.com/electron/electron/releases/download/v33.4.11/electron-v33.4.11-win32-x64.zip
-#    unzip it into node_modules\electron\dist\
-#    then create node_modules\electron\path.txt containing exactly:  electron.exe
+npm run electron:install -- --zip C:\Users\juanj\Downloads\electron-v33.4.11-win32-x64.zip
+
+# 4. last resort, fully by hand: unzip that file into node_modules\electron\dist\
+#    (it must contain electron.exe and a `version` file) and create
+#    node_modules\electron\path.txt containing exactly:  electron.exe  (no newline)
 ```
 
 Notes for Windows:
