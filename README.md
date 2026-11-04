@@ -37,34 +37,52 @@ npm run bundle          # builds out/ + NSIS installer + portable exe in release
 npm run bundle:dir      # same, but only the unpacked app folder (faster, no installer)
 ```
 
-Each of those is a **single script** (`tools/electron-dev.mjs`) that does the whole
-job itself — it does not rely on npm `pre*`/`post*` hooks, because newer npm
-versions gate dependency install scripts (`install-scripts approve …`) and skip
-lifecycle hooks entirely when `ignore-scripts` is set. So `npm run electron:dev`
-always installs the Electron binary, builds, verifies the export, and launches.
+Each of those is a **single script** (`tools/electron-dev.mjs`): it does not rely
+on npm `pre*`/`post*` hooks, because newer npm versions gate dependency install
+scripts (`install-scripts approve …`) and skip lifecycle hooks entirely when
+`ignore-scripts` is set. Flags: `--no-build`, `--bundle`, `--bundle-dir`,
+`--dry-run`.
 
-Useful flags: `--no-build`, `--bundle`, `--bundle-dir`, `--dry-run`.
+### Installing the Electron binary
 
-`npm install` also tries to fetch the Electron binary once (postinstall) — that is
-just a convenience; if your npm blocks it, `npm run electron:dev` handles it. To
-check/repair the binary at any time:
+This is standard Electron setup — nothing custom is required:
+
+1. `npm install` runs electron's postinstall (`node node_modules/electron/install.js`),
+   which downloads the runtime into `node_modules/electron/dist` and writes
+   `node_modules/electron/path.txt`.
+2. `npm run electron:doctor` confirms it: `OK — binary already installed: …`.
+
+If npm gated that script (npm ≥ 11.7 blocks dependency scripts until approved), do
+it the documented way:
 
 ```bash
-npm run electron:doctor                        # report whether the binary is present and usable
-npm run electron:install                       # (re)install it
-npm run electron:install -- --force            # re-download and reinstall
-npm run electron:install -- --zip <file.zip>   # install from a zip you downloaded
-npm run verify:export                          # sanity-check out/ before shipping it in the shell
+npm install-scripts approve electron    # allow this npm to run electron's install script
+npm rebuild electron                    # re-runs electron's install.js
+npm run electron:doctor                 # verify
 ```
 
-`npm install` may still print
-`npm warn install-scripts   electron@33.4.11 (postinstall: node install.js)`.
-That is expected and harmless: electron's own postinstall is not used any more —
-this project installs the binary itself.
+`npm run electron:install` is a convenience wrapper around exactly that, and
+repairs half-finished installs (it runs electron's own `install.js` first — the
+official path — and only unpacks the official zip itself if that fails):
 
-Installing the Electron binary needs one ~100 MB download from `github.com`. If
-that is blocked (corporate proxy/firewall, offline machine), see
-[Troubleshooting](#troubleshooting-electron-failed-to-install-correctly).
+```bash
+npm run electron:install                    # official install.js → verify binary
+npm run electron:install -- --official      # official path only, no fallbacks
+npm run electron:install -- --force         # reinstall from scratch
+npm run electron:install -- --zip <f.zip>   # unpack an official zip you downloaded
+npm run electron:install -- --unzip         # skip install.js, unpack the zip directly
+npm run verify:export                       # sanity-check out/ before bundling
+```
+
+Documented environment variables are honoured as-is:
+
+| Variable | Purpose |
+| --- | --- |
+| `ELECTRON_MIRROR` (or `npm config set electron_mirror …`) | alternate download host |
+| `ELECTRON_CUSTOM_DIR` | directory on the mirror |
+| `ELECTRON_GET_USE_PROXY=1` + `GLOBAL_AGENT_HTTPS_PROXY` | proxy support |
+| `electron_config_cache` | artifact cache directory |
+| `ELECTRON_SKIP_BINARY_DOWNLOAD` | skip the binary (breaks the app — we warn) |
 
 ### How the shell loads the app
 
@@ -82,63 +100,73 @@ Error: Electron failed to install correctly, please delete node_modules/electron
     at getElectronPath (node_modules\electron\index.js:17:11)
 ```
 
-The `electron` npm package is just a stub; a postinstall script has to download
-the real binary into `node_modules/electron/dist` and write
-`node_modules/electron/path.txt`. That script does **not** run when
+The `electron` npm package is only a stub; its postinstall must download the real
+binary into `node_modules/electron/dist` and write `node_modules/electron/path.txt`.
+`index.js` throws the error above when `path.txt` is missing, which happens when
 
-- npm blocks dependency install scripts until they are approved
-  (`npm install-scripts approve electron` only affects *later* installs — a
-  following `npm install` that reports “up to date” will not re-run it), or
-- the project was installed with `--ignore-scripts`, or
+- npm gated the dependency install script and it never ran,
+- the project was installed with `--ignore-scripts`,
 - `ELECTRON_SKIP_BINARY_DOWNLOAD` is set in the environment, or
-- the download was interrupted (e.g. a build terminated with `Ctrl+C`).
+- the download/unpack was interrupted (e.g. `Ctrl+C` during a build).
 
-Upstream's `install.js` exits silently in some of those cases, so the failure
-only shows up later when `electron .` runs.
-
-This repo ships `tools/install-electron.mjs`, which verifies the actual
-executable, clears partial installs, downloads from `github.com` (or a mirror),
-checks the archive against Electron's checksums, and reports what it is doing:
+Fix it in this order:
 
 ```bash
-npm run electron:doctor                       # what's wrong, if anything
-npm run electron:install                      # fix it
-npm run electron:install -- --force           # re-download from scratch
-npm run electron:dev                          # build + launch
+npm run electron:doctor                       # what exactly is missing
+npm install-scripts approve electron          # allow electron's postinstall…
+npm rebuild electron                          # …and re-run it (official way)
+npm run electron:install                      # wrapper + repair, if the above fails
 ```
 
-The installer reports progress while it unpacks (~250 MB) and aborts with a
-clear message if the extraction **stalls** for 2 minutes instead of hanging
-forever or exiting silently. If that happens:
+### If unpacking stalls
 
-```bash
-npm run electron:install -- --zip "%LOCALAPPDATA%\electron\Cache\<hash>\electron-v33.4.11-win32-x64.zip"
+Symptom: extraction starts, then nothing — progress repeats the same file name
+with `0 entries, 0 MB`, sometimes for minutes, until the app is still missing.
+That is a *blocked write*, not a slow download: the same thing can happen to
+electron's own `install.js` (`extract-zip` is silent while unpacking).
+
+`npm run electron:install` therefore tries three strategies, in order, and moves
+on automatically when one fails or stalls:
+
+1. electron's own `install.js` (official; generous 90 s watchdog, then handover),
+2. the system unzip tool (`tar` on Windows 10+, `ditto` on macOS, `unzip` on Linux),
+3. an in-process JS extractor, for hosts without any zip tool.
+
+If all three fail, do the manual install yourself:
+
+```bat
+mkdir node_modules\electron\dist
+tar -xf "%LOCALAPPDATA%\electron\Cache\<hash>\electron-v33.4.11-win32-x64.zip" -C node_modules\electron\dist
+node -e "require('fs').writeFileSync('node_modules/electron/path.txt','electron.exe')"
+npm run electron:doctor
 ```
 
-(the exact cache path is printed by the installer). Stalled or failing
-extractions are almost always caused by the project living inside a synced
-folder, or by antivirus scanning every file written into `node_modules` — move
-the project to a local path like `C:\dev\singularity`, or add `node_modules` to
-your antivirus exclusions.
+(that `path.txt` content must be exactly `electron.exe`, with no trailing newline).
 
-If the download is blocked, use a mirror or install the zip by hand:
+Writes into `node_modules` stall almost always because of the environment:
+
+- the project lives in a synced folder (OneDrive/Dropbox/Google Drive) — move it
+  to `C:\dev\singularity`;
+- antivirus real-time scanning every extracted file (~250 MB) — exclude the
+  project folder or `node_modules`;
+- Windows Defender **Controlled Folder Access** (Documents/Desktop are protected
+  folders) — allow `node.exe`/`tar.exe`, or build outside those folders;
+- no disk space (Electron needs ~0.5 GB free).
+
+### Download blocked (no github.com access)
 
 ```bash
-# 1. mirror (e.g. China/Asia, or any internal mirror)
+# 1. mirror
 npm config set electron_mirror https://npmmirror.com/mirrors/electron/
 npm run electron:install -- --force
 
-# 2. proxy
-set HTTPS_PROXY=http://user:pass@host:port      # cmd
-$env:HTTPS_PROXY="http://user:pass@host:port"   # PowerShell
+# 2. proxy (used by @electron/get, the library the installer uses)
+set ELECTRON_GET_USE_PROXY=1                       :: cmd
+set GLOBAL_AGENT_HTTPS_PROXY=http://user:pass@host:port
 
 # 3. download the zip in a browser (any machine), then let the installer unpack it
 #    https://github.com/electron/electron/releases/download/v33.4.11/electron-v33.4.11-win32-x64.zip
 npm run electron:install -- --zip C:\Users\juanj\Downloads\electron-v33.4.11-win32-x64.zip
-
-# 4. last resort, fully by hand: unzip that file into node_modules\electron\dist\
-#    (it must contain electron.exe and a `version` file) and create
-#    node_modules\electron\path.txt containing exactly:  electron.exe  (no newline)
 ```
 
 ### `Next.js inferred your workspace root` warning

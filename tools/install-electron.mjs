@@ -1,43 +1,57 @@
 #!/usr/bin/env node
 /**
- * install-electron.mjs — deterministic Electron binary installer / verifier.
+ * install-electron.mjs — install the Electron binary the officially documented
+ * way, verify it, and repair it when it is broken.
  *
- * Why this exists
- * ---------------
- * `electron` ships an empty package; its *postinstall* script downloads the
- * ~100 MB platform binary into `node_modules/electron/dist` and writes
- * `node_modules/electron/path.txt`. When that script never runs — modern npm
- * blocks dependency lifecycle scripts until they are approved
- * (`npm install-scripts approve electron`), `--ignore-scripts` is used, or the
- * download is interrupted — the package looks installed but
- * `require("electron")` throws:
+ * Background
+ * ----------
+ * The `electron` npm package is a stub: its *postinstall* script
+ * (`node install.js`, using @electron/get + extract-zip) downloads the platform
+ * runtime into `node_modules/electron/dist` and writes `dist/../../path.txt`.
+ * npm may never run that script (newer npm gates dependency install scripts
+ * until approved, `--ignore-scripts`, interrupted installs, or
+ * `ELECTRON_SKIP_BINARY_DOWNLOAD` set), which leaves the package installed but
+ * unusable:
  *
  *   Error: Electron failed to install correctly, please delete node_modules/electron…
  *
- * Upstream's `install.js` is silent in that situation (it exits early when a
- * stale/partial `dist` looks "close enough", or when
- * ELECTRON_SKIP_BINARY_DOWNLOAD is exported), which makes the failure look
- * like a mystery.
- *
- * This script does the same job, but:
- *   - verifies the *actual executable* (not just a version file),
- *   - wipes any partial/stale `dist` before extracting (no half-installed state),
- *   - extracts with its own yauzl loop, into a temp dir, then renames atomically,
- *   - streams per-entry progress and aborts a *stalled* extraction instead of
- *     hanging (or worse: exiting silently with a dangling promise),
- *   - verifies the zip against electron's own checksums.json,
- *   - reports every step, and prints an actionable message on failure
- *     (mirror / proxy / manual zip), instead of failing silently.
+ * Strategy (each step verified before the next one runs)
+ * -----------------------------------------------------
+ *   0. ARCHIVE    — fetch the official zip through @electron/get (the library
+ *                   the official installer uses, so mirrors/proxies/cache behave
+ *                   exactly as documented: ELECTRON_MIRROR, ELECTRON_CUSTOM_DIR,
+ *                   ELECTRON_GET_USE_PROXY, GLOBAL_AGENT_*, electron_config_cache).
+ *   1. OFFICIAL   — run `node node_modules/electron/install.js`, i.e. exactly
+ *                   what npm's postinstall runs, now with a warm cache and a
+ *                   short watchdog (extract-zip prints nothing while unpacking
+ *                   and can hang for minutes).
+ *   2. MANUAL     — the documented manual install: unpack the official zip
+ *                   (from --zip, the @electron/get cache, or a fresh download)
+ *                   with the platform's own unzip tool (tar / ditto / unzip /
+ *                   PowerShell Expand-Archive) and write path.txt.
+ *   3. PURE JS    — same zip, unpacked in-process (yauzl) for hosts without any
+ *                   zip tool.
  *
  * Usage:
- *   node tools/install-electron.mjs                 # install if missing
- *   node tools/install-electron.mjs --check         # report status, exit 1 if broken
- *   node tools/install-electron.mjs --force         # re-download even if present
- *   node tools/install-electron.mjs --zip <file>    # install from a local .zip
- *   node tools/install-electron.mjs --optional      # never fail (used by postinstall)
+ *   node tools/install-electron.mjs                # install / repair
+ *   node tools/install-electron.mjs --check        # report status, exit 1 if broken
+ *   node tools/install-electron.mjs --force        # reinstall from scratch
+ *   node tools/install-electron.mjs --zip <f.zip>  # install from a local archive
+ *   node tools/install-electron.mjs --official     # only step 1
+ *   node tools/install-electron.mjs --unzip        # skip step 1, go straight to 2/3
+ *   node tools/install-electron.mjs --optional     # never fail (npm postinstall)
+ *
+ * Env:
+ *   ELECTRON_MIRROR            mirror base URL (documented by Electron)
+ *   ELECTRON_CUSTOM_DIR        mirror directory (documented by Electron)
+ *   ELECTRON_GET_USE_PROXY=1   use GLOBAL_AGENT_* proxy settings
+ *   electron_config_cache      override the artifact cache directory
+ *   LNP_ELECTRON_OFFICIAL_TIMEOUT_MS  watchdog for step 1 (default 90000)
+ *   LNP_ELECTRON_STALL_MS      watchdog for step 3 (default 120000)
  */
 
-import { createWriteStream, existsSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { createWriteStream, existsSync, statfsSync } from "node:fs";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -47,6 +61,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ELECTRON_DIR = path.join(ROOT, "node_modules", "electron");
 const ELECTRON_PKG = path.join(ELECTRON_DIR, "package.json");
+const INSTALL_JS = path.join(ELECTRON_DIR, "install.js");
 const DIST_DIR = path.join(ELECTRON_DIR, "dist");
 const PATH_FILE = path.join(ELECTRON_DIR, "path.txt");
 
@@ -60,7 +75,10 @@ const FORCE =
 const CHECK_ONLY = argvSet.has("--check");
 const OPTIONAL = argvSet.has("--optional");
 const QUIET = argvSet.has("--quiet");
+const OFFICIAL_ONLY = argvSet.has("--official");
+const SKIP_OFFICIAL = argvSet.has("--unzip");
 const SKIP = process.env.LNP_SKIP_ELECTRON_DOWNLOAD === "1";
+const OFFICIAL_TIMEOUT_MS = Number(process.env.LNP_ELECTRON_OFFICIAL_TIMEOUT_MS || 90_000);
 const STALL_MS = Number(process.env.LNP_ELECTRON_STALL_MS || 120_000);
 
 const log = (...parts) => {
@@ -71,8 +89,8 @@ const fail = (...parts) => console.error("[electron] error:", ...parts);
 
 /**
  * A promise that never settles would let Node drain the event loop and exit 0
- * with no output at all — which is exactly how this install used to fail.
- * These guards make sure that can never happen unnoticed again.
+ * with no output at all. That is exactly how this used to fail, so make sure a
+ * silent exit can never happen again.
  */
 let stage = "startup";
 let completed = false;
@@ -80,9 +98,8 @@ const guard = () => {
   if (completed) return;
   console.error(
     `\n[electron] the installer stopped unexpectedly during "${stage}".\n` +
-      "  This usually means the extraction was blocked or killed (antivirus, OneDrive,\n" +
-      "  disk full) or the zip is corrupt.\n" +
-      "  Retry with:  npm run electron:install -- --force\n",
+      "  Retry with:  npm run electron:install -- --force\n" +
+      "  (see the troubleshooting section in README.md)\n",
   );
   process.exitCode = 1;
 };
@@ -139,29 +156,20 @@ function cacheHint() {
   return "$XDG_CACHE_HOME/electron or ~/.cache/electron/";
 }
 
-function looksSynced(projectDir) {
-  return /onedrive|dropbox|google drive|icloud drive|box sync/i.test(projectDir);
+function freeSpaceHint() {
+  try {
+    const stats = statfsSync(ROOT, { bigint: true });
+    const gb = Number(stats.bavail * stats.bsize) / 1024 ** 3;
+    return gb < 1
+      ? `\n  Disk space: only ${gb.toFixed(2)} GB free on this drive — Electron needs ~0.5 GB.`
+      : "";
+  } catch {
+    return "";
+  }
 }
 
-function manualInstallHint(exeName, archivePath) {
-  const cached = archivePath || "<the downloaded .zip>";
-  return [
-    "",
-    "  If the automatic install keeps failing, install from the zip yourself:",
-    "",
-    "    1. download the zip (browser, another machine, a mirror…), e.g.",
-    `         ${artifactUrl("33.4.11", process.platform, process.arch)}`,
-    "",
-    "    2. let this installer unpack that file for you:",
-    "         npm run electron:install -- --zip <path-to-zip> --force",
-    "",
-    `    3. or do it by hand: unzip into ${DIST_DIR}`,
-    `       (you should end up with ${path.join(DIST_DIR, exeName)}) and create`,
-    `       ${PATH_FILE} containing exactly:  ${exeName}`,
-    "",
-    `    Already downloaded here: ${cached}`,
-    "",
-  ].join("\n");
+function looksSynced(projectDir) {
+  return /onedrive|dropbox|google drive|icloud drive|box sync/i.test(projectDir);
 }
 
 /** Read + validate what is currently on disk. */
@@ -215,24 +223,152 @@ async function removeDir(target, label) {
   }
 }
 
-/** Leftovers from a killed run (`dist.staging-1234`). */
-async function cleanStaleStaging() {
-  let entries;
-  try {
-    entries = await fsp.readdir(ELECTRON_DIR);
-  } catch {
-    return;
-  }
+/** A half-finished install confuses every installer (upstream included). */
+async function cleanBrokenState() {
+  const entries = existsSync(ELECTRON_DIR) ? await fsp.readdir(ELECTRON_DIR) : [];
   for (const name of entries) {
-    if (/^dist\.staging-\d+$/.test(name)) {
-      await removeDir(path.join(ELECTRON_DIR, name), `stale ${name}`).catch(() => {});
+    if (name === "dist" || /^dist\.staging-\d+$/.test(name)) {
+      await removeDir(path.join(ELECTRON_DIR, name), `node_modules/electron/${name}`);
     }
   }
+  await fsp.rm(PATH_FILE, { force: true });
 }
 
+function runCommand(command, commandArgs, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, commandArgs, {
+      stdio: "inherit",
+      windowsHide: true,
+      ...options,
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) resolve();
+      else {
+        const err = new Error(`${command} exited with code ${code}`);
+        err.code = "EEXIT";
+        reject(err);
+      }
+    });
+  });
+}
+
+/** Step 1 — the officially documented mechanism: electron's own install.js. */
+function runOfficialInstaller(version) {
+  log(`official install: node node_modules/electron/install.js  (electron@${version})`);
+  if (!existsSync(INSTALL_JS)) {
+    const err = new Error("node_modules/electron/install.js is missing");
+    err.code = "ENOENT";
+    return Promise.reject(err);
+  }
+
+  return new Promise((resolve, reject) => {
+    const env = { ...process.env };
+    delete env.ELECTRON_SKIP_BINARY_DOWNLOAD; // would make install.js a no-op
+
+    const child = spawn(process.execPath, [INSTALL_JS], {
+      cwd: ELECTRON_DIR,
+      env,
+      stdio: "inherit",
+      windowsHide: false,
+    });
+
+    const started = Date.now();
+    let ticks = 0;
+    const heartbeat = setInterval(() => {
+      ticks += 1;
+      const seconds = Math.round((Date.now() - started) / 1000);
+      if (seconds >= 15) {
+        log(
+          `  … still running (${seconds}s). extract-zip is silent while unpacking ` +
+            `~250 MB; handing over to the system unzip tool at ` +
+            `${Math.round(OFFICIAL_TIMEOUT_MS / 1000)}s.`,
+        );
+      }
+      if (ticks > 1000) clearInterval(heartbeat);
+    }, 10_000);
+
+    const watchdog = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+      const err = new Error(
+        `the official installer did not finish within ${Math.max(1, Math.round(OFFICIAL_TIMEOUT_MS / 1000))}s`,
+      );
+      err.code = "ETIMEDOUT";
+      finish(err);
+    }, OFFICIAL_TIMEOUT_MS);
+
+    let settled = false;
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(heartbeat);
+      clearTimeout(watchdog);
+      if (err) reject(err);
+      else resolve();
+    };
+
+    child.on("error", finish);
+    child.on("exit", (code, signal) => {
+      if (code === 0) return finish();
+      const err = new Error(
+        `the official installer exited with ${signal ? `signal ${signal}` : `code ${code}`}`,
+      );
+      err.code = "EEXIT";
+      finish(err);
+    });
+  });
+}
+
+/** Step 2 — documented manual install: unpack the official zip with a native tool. */
+function nativeUnzip(zipPath, destDir) {
+  const quoted = (value) => `'${value.replace(/'/g, "''")}'`;
+  const attempts = [];
+
+  if (process.platform === "win32") {
+    attempts.push(["tar", ["-xf", zipPath, "-C", destDir]]);
+    attempts.push([
+      "powershell",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `Expand-Archive -LiteralPath ${quoted(zipPath)} -DestinationPath ${quoted(destDir)} -Force`,
+      ],
+    ]);
+  } else if (process.platform === "darwin") {
+    attempts.push(["ditto", ["-x", "-k", zipPath, destDir]]);
+    attempts.push(["unzip", ["-qq", "-o", zipPath, "-d", destDir]]);
+  } else {
+    attempts.push(["unzip", ["-qq", "-o", zipPath, "-d", destDir]]);
+    attempts.push(["bsdtar", ["-xf", zipPath, "-C", destDir]]);
+  }
+
+  return (async () => {
+    const errors = [];
+    for (const [command, commandArgs] of attempts) {
+      try {
+        await runCommand(command, commandArgs);
+        return command;
+      } catch (err) {
+        if (err.code === "ENOENT") {
+          errors.push(`${command}: not available`);
+        } else {
+          errors.push(`${command}: ${err.message}`);
+        }
+      }
+    }
+    const err = new Error(`no native unzip tool could unpack the archive (${errors.join("; ")})`);
+    err.code = "EUNZIP";
+    throw err;
+  })();
+}
+
+/** Step 3 — pure-JS extraction, for hosts with no zip tool at all. */
 function loadYauzl(requireFromElectron) {
-  // yauzl ships with extract-zip (a dependency of electron). Resolve it from
-  // electron's own tree so hoisted and nested layouts both work.
   try {
     return requireFromElectron("yauzl");
   } catch {
@@ -297,11 +433,7 @@ async function extractEntry(zipfile, entry, destDir) {
   await pipeline(readStream, createWriteStream(target, { mode: fileMode }));
 }
 
-/**
- * Unzip with our own loop: per-entry progress, real error propagation, and a
- * stall watchdog. Resolves when every entry has been written and verified.
- */
-async function extractZip(yauzl, zipPath, destDir, { onProgress } = {}) {
+async function jsUnzip(yauzl, zipPath, destDir, { onProgress } = {}) {
   const zipfile = await openZipFile(yauzl, zipPath);
   const stats = { entries: 0, bytes: 0, current: "", lastProgressAt: Date.now() };
 
@@ -324,8 +456,6 @@ async function extractZip(yauzl, zipPath, destDir, { onProgress } = {}) {
       else resolve();
     };
 
-    // Both timers are ref'd on purpose: the event loop stays alive during a
-    // long extraction, so Node can never exit 0 with a dangling promise.
     heartbeat = setInterval(() => onProgress?.(stats), 4000);
     watchdog = setInterval(() => {
       if (Date.now() - stats.lastProgressAt > STALL_MS) {
@@ -360,6 +490,144 @@ async function extractZip(yauzl, zipPath, destDir, { onProgress } = {}) {
   });
 
   return stats;
+}
+
+function troubleshooting({ version, platform, arch, executable, zipPath }) {
+  const url = artifactUrl(version, platform, arch);
+  return [
+    "",
+    "  Electron could not be installed. The documented options are:",
+    "",
+    "    1. use a mirror (many networks block github.com release downloads):",
+    "         npm config set electron_mirror https://npmmirror.com/mirrors/electron/",
+    "         npm run electron:install -- --force",
+    "",
+    "    2. behind a proxy, let @electron/get use it:",
+    '         PowerShell:  $env:ELECTRON_GET_USE_PROXY="1"',
+    '                      $env:GLOBAL_AGENT_HTTPS_PROXY="http://user:pass@host:port"',
+    "",
+    "    3. download the zip yourself, then unpack it with this script:",
+    `         ${url}`,
+    "         npm run electron:install -- --zip <path-to-downloaded-zip>",
+    "",
+    "       or fully by hand:",
+    `         mkdir "${DIST_DIR}"`,
+    `         tar -xf <zip> -C "${DIST_DIR}"`,
+    `         node -e "require('fs').writeFileSync(r'${PATH_FILE}','${executable}')"`,
+    "",
+    zipPath ? `  Archive used: ${zipPath}` : `  Cache: ${cacheHint()}`,
+    freeSpaceHint(),
+    "",
+    "  If it fails while unpacking (silence for minutes, or an antivirus popup),",
+    "  the folder is most likely being scanned or locked. Exclude",
+    `    ${ROOT}`,
+    "  from real-time antivirus scanning, or move the project to a local path such",
+    "  as C:\\dev\\singularity (not OneDrive/Dropbox/Documents-synced folders).",
+    "",
+  ].join("\n");
+}
+
+/** Resolve the official zip: --zip, or @electron/get (documented cache/mirror). */
+async function obtainArchive(requireFromElectron, { version, platform, arch }) {
+  if (LOCAL_ZIP) {
+    log(`using local archive: ${LOCAL_ZIP}`);
+    return LOCAL_ZIP;
+  }
+
+  let downloadArtifact;
+  try {
+    ({ downloadArtifact } = requireFromElectron("@electron/get"));
+  } catch (err) {
+    throw new Error(`could not load @electron/get (${err.message}) — run \`npm install\``);
+  }
+
+  const useRemoteChecksums =
+    process.env.electron_use_remote_checksums === "true" ||
+    process.env.ELECTRON_USE_REMOTE_CHECKSUMS === "true" ||
+    process.env.npm_config_electron_use_remote_checksums === "true";
+  let checksums;
+  if (!useRemoteChecksums) {
+    try {
+      checksums = JSON.parse(
+        await fsp.readFile(path.join(ELECTRON_DIR, "checksums.json"), "utf8"),
+      );
+    } catch {
+      checksums = undefined;
+    }
+  }
+
+  const mirror = process.env.ELECTRON_MIRROR || process.env.npm_config_electron_mirror;
+  log(
+    mirror
+      ? `fetching the official archive via mirror ${mirror} …`
+      : "fetching the official archive via @electron/get (cache first) …",
+  );
+
+  return downloadArtifact({
+    version,
+    artifactName: "electron",
+    platform,
+    arch,
+    force: FORCE,
+    checksums,
+    cacheRoot: process.env.electron_config_cache || undefined,
+    downloadOptions: {
+      quiet: !process.stdout.isTTY,
+      timeout: { request: 15 * 60 * 1000 },
+      retry: { limit: 3 },
+    },
+  });
+}
+
+/** Install the zip into dist/ via a temp dir + atomic rename, then write path.txt. */
+async function unpackArchive({ mode, zipPath, executable, yauzl, distDir }) {
+  const stagingDir = `${distDir}.staging-${process.pid}`;
+  await removeDir(stagingDir, "the staging folder");
+  await fsp.mkdir(stagingDir, { recursive: true });
+
+  try {
+    if (mode === "native") {
+      log("unpacking with the system unzip tool …");
+      const used = await nativeUnzip(zipPath, stagingDir);
+      log(`  unpacked with ${used}`);
+    } else {
+      log("unpacking with the bundled JS extractor …");
+      const started = Date.now();
+      let lastReported = 0;
+      await jsUnzip(yauzl, zipPath, stagingDir, {
+        onProgress: (stats) => {
+          if (QUIET) return;
+          const now = Date.now();
+          if (now - lastReported < 3500) return;
+          lastReported = now;
+          const seconds = Math.max(1, Math.round((now - started) / 1000));
+          const mb = stats.bytes / (1024 * 1024);
+          log(
+            `  … ${stats.entries} entries, ${mb.toFixed(0)} MB, ${seconds}s` +
+              (stats.current ? ` (${path.basename(stats.current)})` : ""),
+          );
+        },
+      });
+    }
+
+    const needVersion = path.join(stagingDir, "version");
+    if (!existsSync(needVersion)) {
+      throw new Error("the archive does not look like an Electron build (no `version` file)");
+    }
+
+    const stagedTypes = path.join(stagingDir, "electron.d.ts");
+    if (existsSync(stagedTypes)) {
+      await fsp.rm(path.join(ELECTRON_DIR, "electron.d.ts"), { force: true });
+      await fsp.rename(stagedTypes, path.join(ELECTRON_DIR, "electron.d.ts"));
+    }
+
+    await removeDir(distDir, "node_modules/electron/dist");
+    await fsp.rename(stagingDir, distDir);
+    await fsp.writeFile(PATH_FILE, executable); // no trailing newline
+  } catch (err) {
+    await removeDir(stagingDir, "the staging folder").catch(() => {});
+    throw err;
+  }
 }
 
 async function main() {
@@ -416,206 +684,115 @@ async function main() {
   }
 
   if (SKIP) {
-    warn("LNP_SKIP_ELECTRON_DOWNLOAD=1 — skipping download at your request.");
+    warn("LNP_SKIP_ELECTRON_DOWNLOAD=1 — skipping install at your request.");
     return exit(1);
   }
 
   if (process.env.ELECTRON_SKIP_BINARY_DOWNLOAD) {
-    // This is the #1 reason `node node_modules/electron/install.js` exits 0
-    // without installing anything, leaving the confusing "failed to install
-    // correctly" error later on. We deliberately override it, because the whole
-    // point of this script is to have a working binary.
+    // The classic reason `npm install` leaves electron broken: install.js exits
+    // 0 immediately. We honour the variable for step 1 (it is the user's shell
+    // setting) but the manual steps below still install a working binary.
     warn(
-      "ELECTRON_SKIP_BINARY_DOWNLOAD is set in your environment — ignoring it so " +
-        "the app can actually run (unset it in your shell profile to silence this).",
+      "ELECTRON_SKIP_BINARY_DOWNLOAD is set — the official installer will be a " +
+        "no-op; falling back to a manual install (unset it in your shell to use " +
+        "the official path).",
     );
   }
 
   const requireFromElectron = createRequire(ELECTRON_PKG);
   const yauzl = loadYauzl(requireFromElectron);
-  if (!yauzl) {
-    fail("could not load the `yauzl` unzip library from node_modules.");
-    console.error(
-      "\n  node_modules looks incomplete. Reinstall dependencies:\n" +
-        "    npm install\n",
-    );
-    return exit(1);
-  }
+  const context = { version, platform, arch, executable };
 
-  let zipPath = LOCAL_ZIP;
+  stage = "cleanup of the previous attempt";
+  await cleanBrokenState();
 
-  if (zipPath) {
-    log(`using local archive: ${zipPath}`);
-  } else {
-    let downloadArtifact;
-    try {
-      ({ downloadArtifact } = requireFromElectron("@electron/get"));
-    } catch (err) {
-      fail("could not load Electron's downloader (@electron/get):", err.message);
-      console.error("\n  node_modules looks incomplete. Run `npm install`.\n");
-      return exit(1);
-    }
+  const failures = [];
 
-    // electron's own checksums let @electron/get verify the archive, so a
-    // truncated/corrupt cached download is detected instead of silently unzipped.
-    // Mirrors/private registries can opt into the mirror's SHASUMS256.txt instead
-    // (same escape hatch as upstream install.js).
-    const useRemoteChecksums =
-      process.env.electron_use_remote_checksums === "true" ||
-      process.env.ELECTRON_USE_REMOTE_CHECKSUMS === "true" ||
-      process.env.npm_config_electron_use_remote_checksums === "true";
-    let checksums;
-    if (!useRemoteChecksums) {
-      try {
-        checksums = JSON.parse(
-          await fsp.readFile(path.join(ELECTRON_DIR, "checksums.json"), "utf8"),
-        );
-      } catch {
-        checksums = undefined;
-      }
-    }
-
-    const mirror = process.env.ELECTRON_MIRROR || process.env.npm_config_electron_mirror;
-    const url = artifactUrl(version, platform, arch);
-    log(
-      mirror
-        ? `downloading via mirror ${mirror} …`
-        : "downloading from github.com (≈100 MB, first run only) …",
-    );
-
-    stage = "download";
-    try {
-      zipPath = await downloadArtifact({
-        version,
-        artifactName: "electron",
-        platform,
-        arch,
-        force: FORCE,
-        checksums,
-        cacheRoot: process.env.electron_config_cache || undefined,
-        downloadOptions: {
-          quiet: !process.stdout.isTTY,
-          timeout: { request: 15 * 60 * 1000 },
-          retry: { limit: 3 },
-        },
-      });
-    } catch (err) {
-      fail("download failed —", String(err && err.message ? err.message : err).split("\n")[0]);
-      console.error(
-        [
-          "",
-          `  Requested: ${url}`,
-          `  Cache:     ${cacheHint()}`,
-          "",
-          "  Common causes: no internet, a corporate proxy/firewall blocking",
-          "  github.com, or a corrupted cached zip.",
-          "",
-          "  Fixes, in order of ease:",
-          "",
-          "    1. Retry with a mirror (region-friendly, works behind many proxies):",
-          "         npm config set electron_mirror https://npmmirror.com/mirrors/electron/",
-          "         npm run electron:install -- --force",
-          "",
-          "    2. If you use a proxy, export it for the download:",
-          '         PowerShell:  $env:HTTPS_PROXY="http://user:pass@host:port"',
-          "         cmd:         set HTTPS_PROXY=http://user:pass@host:port",
-          "",
-          "    3. Or download the zip in a browser and feed it to this installer:",
-          `         ${url}`,
-          "         npm run electron:install -- --zip <path-to-downloaded-zip> --force",
-          manualInstallHint(executable, null),
-        ].join("\n"),
-      );
-      return exit(1);
-    }
-
-    log(`archive ready: ${zipPath}`);
-  }
-
-  await cleanStaleStaging();
-
-  const stagingDir = `${distDir}.staging-${process.pid}`;
-  stage = "cleanup of previous attempt";
-  await removeDir(stagingDir, "the staging folder");
-  await fsp.mkdir(stagingDir, { recursive: true });
-
-  stage = "extraction";
-  log("extracting … (progress is reported every few seconds)");
-  const startedAt = Date.now();
-  let lastReported = 0;
-
+  // The official flow is: download the zip (cache first), then unpack it.
+  // Doing the fetch ourselves first means the official installer only has the
+  // unpacking left, so it can be watched with a short timeout.
+  stage = "archive";
+  let zipPath = null;
   try {
-    await extractZip(yauzl, zipPath, stagingDir, {
-      onProgress: (stats) => {
-        if (QUIET) return;
-        const now = Date.now();
-        // The heartbeat ticks every 4s; log at most one progress line per tick.
-        if (now - lastReported < 3500) return;
-        lastReported = now;
-        const seconds = Math.max(1, Math.round((now - startedAt) / 1000));
-        const mb = stats.bytes / (1024 * 1024);
-        log(
-          `  … ${stats.entries} entries, ${mb.toFixed(0)} MB, ${seconds}s` +
-            (stats.current ? ` (${path.basename(stats.current)})` : ""),
-        );
-      },
-    });
-
-    // Upstream moves the bundled type definitions next to package.json.
-    const stagedTypes = path.join(stagingDir, "electron.d.ts");
-    if (existsSync(stagedTypes)) {
-      await fsp.rm(path.join(ELECTRON_DIR, "electron.d.ts"), { force: true });
-      await fsp.rename(stagedTypes, path.join(ELECTRON_DIR, "electron.d.ts"));
-    }
-
-    stage = "installation";
-    await removeDir(distDir, "node_modules/electron/dist");
-    await fsp.rename(stagingDir, distDir);
-    // path.txt must hold the bare relative executable path, with no newline.
-    await fsp.writeFile(PATH_FILE, executable);
+    zipPath = await obtainArchive(requireFromElectron, context);
+    log(`archive ready: ${zipPath}`);
   } catch (err) {
-    await removeDir(stagingDir, "the staging folder").catch(() => {});
+    failures.push(`archive: ${err.message}`);
+    fail("could not obtain the Electron archive —", err.message);
+    console.error(troubleshooting({ ...context, zipPath: null }));
+    return exit(1);
+  }
 
-    if (err && err.code === "ESTALL") {
-      fail(err.message);
-      console.error(
-        [
-          "",
-          "  Writing the Electron runtime into node_modules appears to be blocked or",
-          "  pathologically slow. Most common causes on Windows:",
-          "",
-          "    - the project lives in OneDrive/Dropbox (move it to e.g. C:\\dev\\singularity)",
-          "    - antivirus scanning every extracted file (~250 MB of writes)",
-          "    - no free disk space (needs ~400 MB)",
-          "",
-          "  You can also let the installer unpack a zip you fetched yourself:",
-          "    npm run electron:install --",
-          `      --zip ${zipPath} --force`,
-          manualInstallHint(executable, zipPath),
-        ].join("\n"),
+  // ---- 1. official installer (exactly what npm's postinstall runs) ----------
+  if (!SKIP_OFFICIAL) {
+    const canTryOfficial = !process.env.ELECTRON_SKIP_BINARY_DOWNLOAD && !LOCAL_ZIP;
+    stage = "official install";
+    if (!canTryOfficial) {
+      log(
+        LOCAL_ZIP
+          ? "skipping the official installer (--zip given)"
+          : "skipping the official installer (ELECTRON_SKIP_BINARY_DOWNLOAD is set)",
       );
-      return exit(1);
+    } else {
+      try {
+        await runOfficialInstaller(version);
+        const after = await inspect({ version, distDir, executable });
+        if (after.ok) {
+          log(`done — ${after.exePath} (installed by electron's own install.js)`);
+          return exit(0);
+        }
+        failures.push("official installer ran but left the package incomplete");
+        log("official installer finished, but the result is still incomplete.");
+      } catch (err) {
+        failures.push(`official installer: ${err.message}`);
+        warn(`official installer failed — ${err.message}`);
+      }
+      if (OFFICIAL_ONLY) {
+        console.error(troubleshooting({ ...context, zipPath }));
+        return exit(1);
+      }
+      await cleanBrokenState();
     }
-
-    fail("extraction failed —", err.message);
-    console.error(
-      `\n  The downloaded archive may be corrupt.\n` +
-        `  Re-run with \`npm run electron:install -- --force\` to download it again.` +
-        manualInstallHint(executable, zipPath),
-    );
-    return exit(1);
   }
 
-  stage = "verification";
-  const finalState = await inspect({ version, distDir, executable });
-  if (!finalState.ok) {
-    fail("install finished but the binary is still not usable:");
-    for (const problem of finalState.problems) log(`  - ${problem}`);
-    return exit(1);
+  // ---- 2. documented manual install: native unzip ---------------------------
+
+  stage = "manual install (system unzip)";
+  try {
+    await unpackArchive({ mode: "native", zipPath, executable, yauzl, distDir });
+    const after = await inspect({ version, distDir, executable });
+    if (after.ok) {
+      log(`done — ${after.exePath}`);
+      return exit(0);
+    }
+    failures.push(`system unzip left the package incomplete: ${after.problems.join("; ")}`);
+  } catch (err) {
+    failures.push(`system unzip: ${err.message}`);
+    warn(`system unzip failed — ${err.message}`);
   }
 
-  log(`done — ${finalState.exePath}`);
-  return exit(0);
+  // ---- 3. pure-JS extraction ------------------------------------------------
+  if (yauzl) {
+    stage = "manual install (JS extractor)";
+    await cleanBrokenState();
+    try {
+      await unpackArchive({ mode: "js", zipPath, executable, yauzl, distDir });
+      const after = await inspect({ version, distDir, executable });
+      if (after.ok) {
+        log(`done — ${after.exePath}`);
+        return exit(0);
+      }
+      failures.push(`JS extractor left the package incomplete: ${after.problems.join("; ")}`);
+    } catch (err) {
+      failures.push(`JS extractor: ${err.message}`);
+      fail("JS extraction failed —", err.message);
+    }
+  }
+
+  fail("could not install the Electron binary.");
+  for (const failure of failures) console.error(`  - ${failure}`);
+  console.error(troubleshooting({ ...context, zipPath }));
+  return exit(1);
 }
 
 main().catch((err) => {
